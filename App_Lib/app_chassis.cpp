@@ -33,6 +33,19 @@ typedef uint8_t u8;
 #define CHASSIS_SPIN_FF_CAN_ID 0x116
 #define CHASSIS_SPIN_PHASE_SCALE 10000.0f
 
+// CAN2 -> 云台 调试遥测(底盘板接不了 Ozone, 发到云台板上用 Ozone 看, 云台那边存进 dbg_chassis):
+//   0x6A0: 四轮目标转速 rpm                     [QZ, HY, QY, HZ]
+//   0x6A1: 四轮实际转速 rpm                     [QZ, HY, QY, HZ]
+//   0x6A2: 四轮最终电流(功率限制后, 即发给 0x200 的值) [QZ, HY, QY, HZ]
+//   0x6A3: 进混合器的 前后*10, 左右*10, 旋转, 云台相对底盘角度(rad, -PI~PI)*10000
+//   0x6A4: 四轮输出绝对值和/2, 功率限制值/2, 电容电压*100, 模式(低 8 位 YK_Mode, 高 8 位 XTL_Flag)
+// 轮子顺序和 0x200 发送顺序一致: QZ=0x201, HY=0x202, QY=0x203, HZ=0x204。
+// ID 比所有电机帧(0x1FE/0x200/0x204...)都大, CAN 仲裁里优先级最低, 只用总线空闲时间。
+// TIM3(500Hz) 每次只发一帧, 5 帧轮流 => 每帧 100Hz。上场前把开关改成 0。
+#define CHASSIS_DEBUG_TX_ENABLE   1
+#define CHASSIS_DEBUG_CAN_ID_BASE 0x6A0
+#define CHASSIS_DEBUG_FRAME_NUM   5
+
 #define XTL_RANDOM_SPEED_RATIO       0.10f
 #define XTL_RANDOM_UPDATE_PERIOD_MS  10U
 #define XTL_RANDOM_TARGET_MIN_MS     300U
@@ -151,6 +164,7 @@ static u8 mid_state;
 
 static float fb_add_sp = 5, fb_cut_sp = 5.5, lr_add_sp = 5, lr_cut_sp = 5.5;
 static float Chassic_Ch0_Real, Chassic_Ch1_Real, Chassic_Ch2_Real;
+static float dbg_mixer_forward, dbg_mixer_right, dbg_mixer_turn; // 调试遥测: 最近一次进混合器的指令(只有 CONTROL/XTL/PLAYER 模式会更新)
 
 static uint32_t name1[5] = {1, 2, 3, 4, 5};
 static graphic_tpyedef graphic_tpye1[7] = {Graphic_Line, Graphic_Line, Graphic_Line, Graphic_Line, Graphic_Line, Graphic_Line, Graphic_Line};
@@ -586,6 +600,10 @@ static void chassic_power_deal(void)
 
 static void QXL_Field_Data_Deal(float forward, float right, float turn, int max_rate)
 {
+  dbg_mixer_forward = forward;
+  dbg_mixer_right = right;
+  dbg_mixer_turn = turn;
+
   const float body_forward = forward * cos_theta + right * sin_theta;
   const float body_right = right * cos_theta - forward * sin_theta;
   DP.QXL_Data_Deal(body_forward, body_right, turn, 0.0f, max_rate);
@@ -996,6 +1014,59 @@ static void UI_TIM2_deal(void)
   ten_flag++;
 }
 
+// 浮点限幅后转 int16, 防止塞进 CAN 帧时溢出
+static int16_t Debug_To_I16(float value)
+{
+  return (int16_t)LIMIT(value, -32768.0f, 32767.0f);
+}
+
+// 调试遥测发送(TIM3 500Hz 调用, 每次只发一帧, 格式见文件开头 CHASSIS_DEBUG_CAN_ID_BASE 注释)
+static void Chassis_Debug_Send(void)
+{
+  static uint8_t debug_frame_cnt = 0;
+
+  if (CHASSIS_DEBUG_TX_ENABLE == 0)
+    return;
+
+  // 至少留一个空邮箱给 0x116/0x558/0x121, 总线忙时宁可这一拍不发调试帧
+  if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan2) < 2)
+    return;
+
+  switch (debug_frame_cnt)
+  {
+    case 0:
+      CAN_Communicate.Send_RM(CHASSIS_DEBUG_CAN_ID_BASE + 0,
+                              Debug_To_I16(DP.QXL.qz), Debug_To_I16(DP.QXL.hy),
+                              Debug_To_I16(DP.QXL.qy), Debug_To_I16(DP.QXL.hz));
+      break;
+    case 1:
+      CAN_Communicate.Send_RM(CHASSIS_DEBUG_CAN_ID_BASE + 1,
+                              M3508_MOTOR_QZ.sp, M3508_MOTOR_HY.sp,
+                              M3508_MOTOR_QY.sp, M3508_MOTOR_HZ.sp);
+      break;
+    case 2:
+      CAN_Communicate.Send_RM(CHASSIS_DEBUG_CAN_ID_BASE + 2,
+                              Debug_To_I16(DP_Power_Limit.PID_1_out), Debug_To_I16(DP_Power_Limit.PID_2_out),
+                              Debug_To_I16(DP_Power_Limit.PID_3_out), Debug_To_I16(DP_Power_Limit.PID_4_out));
+      break;
+    case 3:
+      // theta_rad 本身不在 -PI~PI 里(减了 Motor_Yaw_front), 用 atan2 归一化后再放大
+      CAN_Communicate.Send_RM(CHASSIS_DEBUG_CAN_ID_BASE + 3,
+                              Debug_To_I16(dbg_mixer_forward * 10.0f), Debug_To_I16(dbg_mixer_right * 10.0f),
+                              Debug_To_I16(dbg_mixer_turn), Debug_To_I16(atan2f(sin_theta, cos_theta) * 10000.0f));
+      break;
+    default:
+      CAN_Communicate.Send_RM(CHASSIS_DEBUG_CAN_ID_BASE + 4,
+                              Debug_To_I16(DP_Power_Limit.TotalOutput * 0.5f), Debug_To_I16(DP_Power_Limit.limit_output * 0.5f),
+                              Debug_To_I16(V_Cap), (int16_t)(YK_Mode | (XTL_Flag << 8)));
+      break;
+  }
+
+  debug_frame_cnt++;
+  if (debug_frame_cnt >= CHASSIS_DEBUG_FRAME_NUM)
+    debug_frame_cnt = 0;
+}
+
 void App_Chassis_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim == &htim3)
@@ -1011,6 +1082,7 @@ void App_Chassis_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     {
       Motor_Flag.TIM3_Flag = 0;
     }
+    Chassis_Debug_Send();
   }
 
   if (htim == &htim5)
